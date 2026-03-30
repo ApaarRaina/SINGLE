@@ -35,13 +35,13 @@ class ResnetBlock(nn.Module):
         return hidden + self.residual_conv(x)
 
 
-class Attention(nn.Module):
-    def __init__(self, dim, groups=32):
+class LinearAttention(nn.Module):
+    def __init__(self, dim, groups=32, heads=4):
         super().__init__()
-
         self.dim, self.dim_out = dim, dim
+        self.heads = heads
+        self.head_dim = dim // heads
 
-        self.scale = dim ** (-0.5)  # 1 / sqrt(d_k)
         self.norm = nn.GroupNorm(num_groups=groups, num_channels=dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, kernel_size=(1, 1))
         self.to_out = nn.Conv2d(dim, dim, kernel_size=(1, 1))
@@ -49,39 +49,79 @@ class Attention(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.to_qkv(self.norm(x)).chunk(3, dim=1)
-        # You can think (h*w) as sequence length where c is d_k in <Attention is all you need>
-        q, k, v = map(lambda t: rearrange(t, 'b c h w -> b (h w) c'), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (heads d) h w -> b heads d (h w)',
+                                           heads=self.heads), qkv)
 
-        """
-        q, k, v shape: (batch, seq_length, d_k)  seq_length = height*width, d_k == c == dim
-        similarity shape: (batch, seq_length, seq_length)
-        attention_score shape: (batch, seq_length, seq_length)
-        attention shape: (batch, seq_length, d_k)
-        out shape: (batch, d_k, height, width)  d_k == c == dim
-        return shape: (batch, dim, height, width)
-        """
+        # Kernel trick: use ELU+1 as feature map φ(x)
+        q = torch.nn.functional.elu(q) + 1
+        k = torch.nn.functional.elu(k) + 1
 
-        similarity = torch.einsum('b i c, b j c -> b i j', q, k)  # Q(K^T)
-        attention_score = torch.softmax(similarity * self.scale, dim=-1)  # softmax(Q(K^T) / sqrt(d_k))
-        attention = torch.einsum('b i j, b j c -> b i c', attention_score, v)
-        # attention(Q, K, V) = [softmax(Q(K^T) / sqrt(d_k))]V -> Scaled Dot-Product Attention
-        out = rearrange(attention, 'b (h w) c -> b c h w', h=h, w=w)
+        # Linear attention: Q(KᵀV) instead of softmax(QKᵀ)V
+        k_sum = k.sum(dim=-1, keepdim=True)          # normalization term
+        kv = torch.einsum('b h d n, b h e n -> b h d e', k, v)  # (KᵀV)
+        out = torch.einsum('b h d e, b h d n -> b h e n', kv, q)  # Q(KᵀV)
+
+        # Normalize
+        denom = torch.einsum('b h d n, b h d s -> b h n s', q, k_sum).squeeze(-1)
+        out = out / (denom.unsqueeze(2) + 1e-6)
+
+        out = rearrange(out, 'b heads d (h w) -> b (heads d) h w', h=h, w=w)
+        return self.to_out(out) + x
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, context_dim, groups=32):
+        super().__init__()
+        self.dim, self.dim_out = dim, dim
+
+        self.scale = dim ** (-0.5)
+        self.norm = nn.GroupNorm(num_groups=groups, num_channels=dim)
+        self.norm_context = nn.LayerNorm(context_dim)
+
+        # Q comes from image features, K and V come from context
+        self.to_q  = nn.Conv2d(dim, dim, kernel_size=(1, 1))
+        self.to_kv = nn.Linear(context_dim, dim * 2)
+        self.to_out = nn.Conv2d(dim, dim, kernel_size=(1, 1))
+
+    def forward(self, x, context):
+        # x:       (B, C, H, W)  — image features
+        # context: (B, seq_len, context_dim)  — e.g. text tokens
+        b, c, h, w = x.shape
+
+        q = self.to_q(self.norm(x))
+        q = rearrange(q, 'b c h w -> b (h w) c')
+
+        context = self.norm_context(context)
+        k, v = self.to_kv(context).chunk(2, dim=-1)  # both: (B, seq_len, dim)
+
+        similarity = torch.einsum('b i c, b j c -> b i j', q, k) * self.scale
+        attn = torch.softmax(similarity, dim=-1)
+        out = torch.einsum('b i j, b j c -> b i c', attn, v)
+
+        out = rearrange(out, 'b (h w) c -> b c h w', h=h, w=w)
         return self.to_out(out) + x
 
 
 
 class ResnetAttentionBlock(nn.Module):
-    def __init__(self, dim, dim_out=None, time_emb_dim=None, dropout=None, groups=32):
+    def __init__(self, dim, dim_out=None, time_emb_dim=None, dropout=None, groups=32, context_dim=None):
         super().__init__()
 
         self.dim, self.dim_out = dim, dim_out
 
         self.resnet = ResnetBlock(dim, dim_out, time_emb_dim, dropout, groups)
-        self.attention = Attention(dim_out, groups)
+        self.attention = LinearAttention(dim_out, groups)
+        self.cross_attn = CrossAttention(dim_out, context_dim, groups) \
+                          if context_dim is not None else None
 
-    def forward(self, x, time_emb=None):
+    def forward(self, x, time_emb=None, context=None):
         x = self.resnet(x, time_emb)
-        return self.attention(x)
+        x= self.attention(x)
+        if self.cross_attn is not None and context is not None:
+            x = self.cross_attn(x, context)
+        
+        return x
+        
 
 
 class downSample(nn.Module):
@@ -111,7 +151,7 @@ class upSample(nn.Module):
 
 class Unet(nn.Module):
     def __init__(self, dim, image_size, dim_multiply=(1, 2, 4, 8), channel=1, num_res_blocks=2,
-                 attn_resolutions=(16,), dropout=0, device='cuda', groups=32):
+                 attn_resolutions=(16,), dropout=0, device='cuda', groups=32, context_dim=None):
 
         super().__init__()
         assert dim % groups == 0, 'parameter [groups] must be divisible by parameter [dim]'
@@ -147,7 +187,7 @@ class Unet(nn.Module):
             for block in range(num_res_blocks):
                 d_in_ = d_in if block == 0 else d_out
                 if self.resolution[level] in attn_resolutions:
-                    self.down_path.append(ResnetAttentionBlock(d_in_, d_out, self.time_emb_dim, dropout, groups))
+                    self.down_path.append(ResnetAttentionBlock(d_in_, d_out, self.time_emb_dim, dropout, groups, context_dim=context_dim))
                 else:
                     self.down_path.append(ResnetBlock(d_in_, d_out, self.time_emb_dim, dropout, groups))
                 concat_dim.append(d_out)
@@ -157,7 +197,7 @@ class Unet(nn.Module):
 
         # Middle layer definition
         mid_dim = self.hidden_dims[-1]
-        self.middle_resnet_attention = ResnetAttentionBlock(mid_dim, mid_dim, self.time_emb_dim, dropout, groups)
+        self.middle_resnet_attention = ResnetAttentionBlock(mid_dim, mid_dim, self.time_emb_dim, dropout, groups, context_dim=context_dim)
         self.middle_resnet = ResnetBlock(mid_dim, mid_dim, self.time_emb_dim, dropout, groups)
 
         # Upward Path layer definition
@@ -167,7 +207,7 @@ class Unet(nn.Module):
                 d_in = self.hidden_dims[level + 2] if block == 0 and level != self.num_resolutions - 1 else d_out
                 d_in = d_in + concat_dim.pop()
                 if self.resolution[level] in attn_resolutions:
-                    self.up_path.append(ResnetAttentionBlock(d_in, d_out, self.time_emb_dim, dropout, groups))
+                    self.up_path.append(ResnetAttentionBlock(d_in, d_out, self.time_emb_dim, dropout, groups, context_dim=context_dim))
                 else:
                     self.up_path.append(ResnetBlock(d_in, d_out, self.time_emb_dim, dropout, groups))
             if level != 0:
@@ -181,7 +221,7 @@ class Unet(nn.Module):
         self.final_activation = nn.SiLU()
         self.final_conv = nn.Conv2d(final_ch, channel, kernel_size=(3, 3), padding=1)
 
-    def forward(self, x, time):
+    def forward(self, x, time, context=None):
 
         t = self.time_mlp(time)
         # Downward
@@ -189,18 +229,28 @@ class Unet(nn.Module):
         x = self.init_conv(x)
         concat.append(x)
         for layer in self.down_path:
-            x = layer(x, t) if not isinstance(layer, (upSample, downSample)) else layer(x)
+            if isinstance(layer, downSample):
+                x = layer(x)
+            elif isinstance(layer, ResnetAttentionBlock):
+                x = layer(x, t, context)
+            else:  # ResnetBlock
+                x = layer(x, t)
             concat.append(x)
 
         # Middle
-        x = self.middle_resnet_attention(x, t)
+        x = self.middle_resnet_attention(x, t, context)
         x = self.middle_resnet(x, t)
 
         # Upward
         for layer in self.up_path:
-            if not isinstance(layer, upSample):
+            if isinstance(layer, upSample):
+                x = layer(x)
+            else:
                 x = torch.cat((x, concat.pop()), dim=1)
-            x = layer(x, t) if not isinstance(layer, (upSample, downSample)) else layer(x)
+                if isinstance(layer, ResnetAttentionBlock):
+                    x = layer(x, t, context)
+                else:  # ResnetBlock
+                    x = layer(x, t)
 
         # Final
         x = self.final_activation(self.final_norm(x))
